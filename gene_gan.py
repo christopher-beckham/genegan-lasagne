@@ -20,7 +20,6 @@ import pickle
 import sys
 import gzip
 
-
 #from util import iterate_hdf5, Hdf5Iterator, convert_to_rgb, compose_imgs, plot_grid
 
 def encoder(enc_size=64, feat_size=64):
@@ -34,7 +33,7 @@ def encoder(enc_size=64, feat_size=64):
         Conv2DLayer(conv_layer, num_filters=(i+1)*32, filter_size=2, nonlinearity=leaky_relu)
     )
     l_enc = DenseLayer(conv_layer, num_units=enc_size, nonlinearity=leaky_relu)
-    l_feat = DenseLayer(conv_layer, num_units=feat_size, nonlinearity=leaky_relu)
+    l_feat = DenseLayer(conv_layer, num_units=feat_size, nonlinearity=linear)
     return {"l_enc": l_enc, "l_feat": l_feat}
 
 def decoder(enc_size=64, feat_size=64):
@@ -141,7 +140,7 @@ class GeneGAN():
         disc_2_loss = adv_loss(disc_for_Au, 1.).mean() + adv_loss(disc_for_Bu, 0.).mean()
         Bu_generator_loss = adv_loss(disc_for_Bu, 1.).mean()
         # **Total loss: reconstruction error + GAN loss to distinguish Bu (fake) and Au (real)**
-        total_generator_loss_2 = Bu_generator_loss + B0_recon_loss + eps_loss
+        total_generator_loss_2 = Bu_generator_loss + lambda_recon*B0_recon_loss + eps_loss
         # TOTAL GENERATOR LOSS
         total_loss = total_generator_loss + total_generator_loss_2
         # -----------------------------
@@ -153,7 +152,7 @@ class GeneGAN():
         gen_updates = opt(total_loss, tot_gen_params, **opt_args)
         gen_updates.update(opt(disc_1_loss, disc1_params, **opt_args))
         gen_updates.update(opt(disc_2_loss, disc2_params, **opt_args))
-        keys = [A0_generator_loss, Bu_generator_loss, Au_recon_loss, B0_recon_loss, eps_loss, disc_1_loss, disc_2_loss]
+        keys = [A0_generator_loss, Bu_generator_loss, Au_recon_loss, B0_recon_loss, eps_loss, total_loss, disc_1_loss, disc_2_loss]
         self.train_fn = theano.function([Au, B0], keys, updates=gen_updates)
         self.loss_fn = theano.function([Au, B0], keys)
         # decompose Au into [A,u]
@@ -170,7 +169,7 @@ class GeneGAN():
         self.dec_use_a_fn = theano.function([Au, a], decode_into_Au_using_a)
         # ------------
         self.lr = opt_args['learning_rate']
-        self.train_keys = ['Au_gen', 'Bu_gen', 'Au_recon', 'B0_recon', 'eps', 'B0_A0_disc', 'Au_Bu_disc'] # TODO:
+        self.train_keys = ['Au_gen', 'Bu_gen', 'Au_recon', 'B0_recon', 'eps', 'gen_tot', 'B0_A0_disc', 'Au_Bu_disc'] # TODO:
         self.dd = dd
         self.dd_dec = dd_dec
         self.disc = disc
@@ -285,13 +284,15 @@ class MnistIterator():
 if __name__ == '__main__':
     
     itr = MnistIterator(9,0,32,True)
+    # lr
     model = GeneGAN(
         encoder_fn=encoder,
         decoder_fn=decoder,
         encoder_params={'enc_size':64, 'feat_size':64},
         decoder_params={'enc_size':64, 'feat_size':64},
         discriminator_fn=discriminator,
-        discriminator_params={})
+        discriminator_params={},
+        opt_args={'learning_rate':theano.shared(floatX(1e-4))})
     model.train(it_train=itr, it_val=itr, batch_size=32, num_epochs=100,
                 out_dir="output/deleteme")
     
