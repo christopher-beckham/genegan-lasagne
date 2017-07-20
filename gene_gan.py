@@ -23,29 +23,37 @@ import gzip
 #from util import iterate_hdf5, Hdf5Iterator, convert_to_rgb, compose_imgs, plot_grid
 
 def encoder(enc_size=64, feat_size=64):
+    # TODO: enc/feat size not used
     l_in_conv = InputLayer((None,1,28,28))
     conv_layer = l_in_conv
+    nf = 64
     for i in range(3):
         conv_layer = batch_norm(
-            Conv2DLayer(conv_layer, num_filters=(i+1)*32, filter_size=3, stride=2, nonlinearity=leaky_relu)
+            Conv2DLayer(conv_layer, num_filters=(i+1)*nf, filter_size=3, stride=2, nonlinearity=leaky_relu)
         )
     conv_layer = batch_norm(
-        Conv2DLayer(conv_layer, num_filters=(i+1)*32, filter_size=2, nonlinearity=leaky_relu)
+        Conv2DLayer(conv_layer, num_filters=(i+1)*nf, filter_size=2, nonlinearity=leaky_relu)
     )
-    l_enc = DenseLayer(conv_layer, num_units=enc_size, nonlinearity=leaky_relu)
-    l_feat = DenseLayer(conv_layer, num_units=feat_size, nonlinearity=linear)
+    #l_enc = DenseLayer(conv_layer, num_units=enc_size, nonlinearity=leaky_relu)
+    #l_feat = DenseLayer(conv_layer, num_units=feat_size, nonlinearity=linear)
+    nf_final = conv_layer.output_shape[1]
+    feat_how_many = int(nf_final*0.25)
+    l_feat = SliceLayer(conv_layer, indices=slice(0,feat_how_many), axis=1)
+    l_enc = SliceLayer(conv_layer, indices=slice(feat_how_many, nf_final), axis=1)
     return {"l_enc": l_enc, "l_feat": l_feat}
 
 def decoder(enc_size=64, feat_size=64):
-    l_in_enc = InputLayer((None, enc_size))
-    l_in_feat = InputLayer((None, feat_size))
-    l_concat = ConcatLayer((l_in_enc, l_in_feat))
-    l_dense = batch_norm(DenseLayer(l_concat, 96*1*1, nonlinearity=leaky_relu))
-    l_reshape = ReshapeLayer(l_dense, (-1, 96, 1, 1))
-    deconv_layer = l_reshape
+    # TODO: enc/feat size not used
+    l_in_feat = InputLayer((None, 48, 1, 1))
+    l_in_enc = InputLayer((None, 144, 1, 1))
+    l_concat = ConcatLayer((l_in_enc, l_in_feat), axis=1)
+    #l_dense = batch_norm(DenseLayer(l_concat, 96*1*1, nonlinearity=leaky_relu))
+    #l_reshape = ReshapeLayer(l_dense, (-1, 96, 1, 1))
+    deconv_layer = l_concat
+    nf=64
     for i in range(3, 0, -1):
         deconv_layer = batch_norm(
-            Deconv2DLayer(deconv_layer, filter_size=3, num_filters=i*32, stride=2, nonlinearity=leaky_relu)
+            Deconv2DLayer(deconv_layer, filter_size=3, num_filters=i*64, stride=2, nonlinearity=leaky_relu)
         )
     deconv_layer = Deconv2DLayer(
         deconv_layer, filter_size=4, num_filters=1, stride=2, crop=2, nonlinearity=sigmoid)
@@ -54,12 +62,13 @@ def decoder(enc_size=64, feat_size=64):
 def discriminator():
     l_in_conv = InputLayer((None,1,28,28))
     conv_layer = l_in_conv
+    nf=32
     for i in range(3):
-        conv_layer = Conv2DLayer(
-            conv_layer, num_filters=(i+1)*16, filter_size=3, stride=2, nonlinearity=leaky_relu)
-    conv_layer = Conv2DLayer(
-        conv_layer, num_filters=(i+1)*16, filter_size=2, nonlinearity=leaky_relu)
-    l_sigm = DenseLayer(conv_layer, num_units=1, nonlinearity=sigmoid)
+        conv_layer = batch_norm(Conv2DLayer(
+            conv_layer, num_filters=(i+1)*nf, filter_size=3, stride=2, nonlinearity=leaky_relu))
+    conv_layer = batch_norm(Conv2DLayer(
+        conv_layer, num_filters=(i+1)*nf, filter_size=2, nonlinearity=leaky_relu))
+    l_sigm = DenseLayer(conv_layer, num_units=1, nonlinearity=linear)
     return l_sigm
 
 class GeneGAN():
@@ -72,20 +81,23 @@ class GeneGAN():
                  encoder_fn, decoder_fn,
                  encoder_params, decoder_params,
                  discriminator_fn, discriminator_params,
+                 im_shp=(1,28,28),
                  lambda_recon=1.,
                  opt=adam, opt_args={'learning_rate':theano.shared(floatX(1e-3))},
-                 reconstruction='l1', lsgan=False, verbose=True):
+                 reconstruction='l1', lsgan=True, verbose=True):
+        self.im_shp = im_shp
         self.verbose = verbose
         # get the networks for the p2p network
         dd = encoder(**encoder_params)
         dd['dummy_out'] = ConcatLayer( [dd['l_enc'], dd['l_feat']] )
         dd_dec = decoder(**decoder_params)
+        self.latent_dim = dd['l_feat'].output_shape[-1]
         if verbose:
             self.print_network(dd['dummy_out'])
             self.print_network(dd_dec['out']) # TODO: concat
         Au = T.tensor4('Au')
         B0 = T.tensor4('B0')
-        a = T.fmatrix('a') # let the user input their own latent vector
+        a = T.tensor4('a') # let the user input their own latent vector
         if lsgan:
             adv_loss = squared_error
         else:
@@ -141,6 +153,8 @@ class GeneGAN():
         Bu_generator_loss = adv_loss(disc_for_Bu, 1.).mean()
         # **Total loss: reconstruction error + GAN loss to distinguish Bu (fake) and Au (real)**
         total_generator_loss_2 = Bu_generator_loss + lambda_recon*B0_recon_loss + eps_loss
+        # parallelogram loss
+        #pgram_loss = T.abs_(Au + B0 - decode_into_A0 - decode_into_Bu).mean()*0.01
         # TOTAL GENERATOR LOSS
         total_loss = total_generator_loss + total_generator_loss_2
         # -----------------------------
@@ -169,7 +183,7 @@ class GeneGAN():
         self.dec_use_a_fn = theano.function([Au, a], decode_into_Au_using_a)
         # ------------
         self.lr = opt_args['learning_rate']
-        self.train_keys = ['Au_gen', 'Bu_gen', 'Au_recon', 'B0_recon', 'eps', 'gen_tot', 'B0_A0_disc', 'Au_Bu_disc'] # TODO:
+        self.train_keys = ['A0_gen', 'Bu_gen', 'Au_recon', 'B0_recon', 'eps', 'gen_tot', 'B0_A0_disc', 'Au_Bu_disc'] # TODO:
         self.dd = dd
         self.dd_dec = dd_dec
         self.disc = disc
@@ -190,7 +204,7 @@ class GeneGAN():
         with gzip.open(filename) as g:
             dd = pickle.load(g)
             set_all_param_values(self.dd['dummy_out'], dd['gen'])
-            set_all_param_values(self.dd['disc'], dd['disc'])                
+            set_all_param_values(self.dd['disc'], dd['disc'])
             set_all_param_values(self.dd['disc2'], dd['disc2'])
             
     def train(self, it_train, it_val, batch_size, num_epochs, out_dir, model_dir=None, save_every=10, resume=False, reduce_on_plateau=False, schedule={}, quick_run=False):
@@ -251,6 +265,15 @@ class GeneGAN():
             out_str = ",".join(out_str)
             print out_str
             f.write("%s\n" % out_str); f.flush()
+            dump_train = "%s/dump_train" % out_dir
+            dump_valid = "%s/dump_valid" % out_dir
+            for path in [dump_train, dump_valid]:
+                if not os.path.exists(path):
+                    os.makedirs(path)
+            self.plot(it_train, "%s/remove_%i.png" % (dump_train,e+1), mode='remove')
+            self.plot(it_train, "%s/add_%i.png" % (dump_train,e+1), mode='add')
+            self.plot(it_val, "%s/remove_%i.png" % (dump_valid,e+1), mode='remove')
+            self.plot(it_val, "%s/add_%i.png" % (dump_valid,e+1), mode='add')
             """
             # plot nice grids
             plot_grid("%s/atob_%i.png" % (out_dir,e+1), it_val, self.atob_fn, invert=False, is_a_grayscale=self.is_a_grayscale, is_b_grayscale=self.is_b_grayscale)
@@ -261,19 +284,54 @@ class GeneGAN():
             """
             if model_dir != None and (e+1) % save_every == 0:
                 self.save_model("%s/%i.model" % (model_dir, e+1))
+
+    def plot(self, itr, out_file, grid_size=10, mode='remove'):
+        assert mode in ['remove', 'add']
+        # remove = decompose Au into [A,u], change u -> 0 then decode
+        # add = decompose B0 into [B,0], change 0 -> randomly sampled u then decode
+        im_dim = self.im_shp[-1]
+        grid = np.zeros((im_dim*grid_size, im_dim*grid_size, self.im_shp[0]), dtype="float32")
+        for i in range(grid_size):
+            for j in range(grid_size):
+                this_Au, this_B0 = itr.next()
+                if mode == 'remove':
+                    # ok, go from Au to A0
+                    target = self.zero_fn(this_Au)
+                else:
+                    # ok, go from B0 to Ba
+                    # TODO: figure out bottleneck size
+                    #a_fake = floatX(np.random.normal(0,1,size=(this_B0.shape[0],self.latent_dim)))
+                    #a_actual = a_fake
+                    # get from real latent factors from the Au data
+                    _, a_actual = self.enc_fn(this_Au)
+                    # then use those to replace the '0' factor for B0
+                    target = self.dec_use_a_fn(this_B0, a_actual)
+                grid[i*im_dim:(i+1)*im_dim, j*im_dim:(j+1)*im_dim, :] = target[0].swapaxes(0,1).swapaxes(1,2)
+        from skimage.io import imsave
+        if self.im_shp[0]==1:
+            imsave(arr=grid[:,:,0],fname=out_file)
+        else:
+            imsave(arr=grid,fname=out_file)
+
+                
 class MnistIterator():
     def _iterator(self,X_Au, X_B0, bs, shuffle):
-        if shuffle:
-            np.random.shuffle(X_Au)
-            np.random.shuffle(X_B0)
         while True:
+            if shuffle:
+                np.random.shuffle(X_Au)
+                np.random.shuffle(X_B0)
             for b in range(self.N // bs):
                 yield X_Au[b*bs:(b+1)*bs], X_B0[b*bs:(b+1)*bs]
-    def __init__(self, c1, c2, bs, shuffle):
+    def __init__(self, mode, c1, c2, bs, shuffle):
+        assert mode in ['train', 'valid']
         from load_mnist import load_dataset
-        X_train, y_train, _, _, _, _ = load_dataset()
-        X_Au = X_train[y_train == c1]
-        X_B0 = X_train[y_train == c2]
+        X_train, y_train, X_valid, y_valid, _, _ = load_dataset()
+        if mode == 'train':
+            X_Au = X_train[y_train == c1]
+            X_B0 = X_train[y_train == c2]
+        else:
+            X_Au = X_valid[y_valid == c1]
+            X_B0 = X_valid[y_valid == c2]            
         self.fn = self._iterator(X_Au, X_B0, bs, shuffle)
         self.N = min(X_Au.shape[0], X_B0.shape[0])
     def __iter__(self):
@@ -282,17 +340,20 @@ class MnistIterator():
         return self.fn.next()
             
 if __name__ == '__main__':
-    
-    itr = MnistIterator(9,0,32,True)
+
+    itr_train = MnistIterator('train',9,0,32,True)
+    itr_valid = MnistIterator('valid',9,0,32,True)
     # lr
+    encode_decode_params = {'enc_size':64, 'feat_size':64}
     model = GeneGAN(
         encoder_fn=encoder,
         decoder_fn=decoder,
-        encoder_params={'enc_size':64, 'feat_size':64},
-        decoder_params={'enc_size':64, 'feat_size':64},
+        encoder_params=encode_decode_params,
+        decoder_params=encode_decode_params,
         discriminator_fn=discriminator,
         discriminator_params={},
-        opt_args={'learning_rate':theano.shared(floatX(1e-4))})
-    model.train(it_train=itr, it_val=itr, batch_size=32, num_epochs=100,
-                out_dir="output/deleteme")
-    
+        opt_args={'learning_rate':theano.shared(floatX(2e-4))})
+    name = "deleteme_64c_pgram"
+    model.train(it_train=itr_train, it_val=itr_valid, batch_size=128, num_epochs=1000,
+                out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={300: 2e-5})
+
