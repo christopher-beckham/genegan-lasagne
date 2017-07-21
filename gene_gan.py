@@ -3,7 +3,6 @@ from theano import tensor as T
 import lasagne
 from lasagne.layers import *
 from lasagne.nonlinearities import *
-leaky_relu = LeakyRectify(0.2)
 from lasagne.init import *
 from lasagne.updates import *
 from lasagne.objectives import *
@@ -22,55 +21,6 @@ import gzip
 
 #from util import iterate_hdf5, Hdf5Iterator, convert_to_rgb, compose_imgs, plot_grid
 
-def encoder(enc_size=64, feat_size=64):
-    # TODO: enc/feat size not used
-    l_in_conv = InputLayer((None,1,28,28))
-    conv_layer = l_in_conv
-    nf = 64
-    for i in range(3):
-        conv_layer = batch_norm(
-            Conv2DLayer(conv_layer, num_filters=(i+1)*nf, filter_size=3, stride=2, nonlinearity=leaky_relu)
-        )
-    conv_layer = batch_norm(
-        Conv2DLayer(conv_layer, num_filters=(i+1)*nf, filter_size=2, nonlinearity=leaky_relu)
-    )
-    #l_enc = DenseLayer(conv_layer, num_units=enc_size, nonlinearity=leaky_relu)
-    #l_feat = DenseLayer(conv_layer, num_units=feat_size, nonlinearity=linear)
-    nf_final = conv_layer.output_shape[1]
-    feat_how_many = int(nf_final*0.25)
-    l_feat = SliceLayer(conv_layer, indices=slice(0,feat_how_many), axis=1)
-    l_enc = SliceLayer(conv_layer, indices=slice(feat_how_many, nf_final), axis=1)
-    return {"l_enc": l_enc, "l_feat": l_feat}
-
-def decoder(enc_size=64, feat_size=64):
-    # TODO: enc/feat size not used
-    l_in_feat = InputLayer((None, 48, 1, 1))
-    l_in_enc = InputLayer((None, 144, 1, 1))
-    l_concat = ConcatLayer((l_in_enc, l_in_feat), axis=1)
-    #l_dense = batch_norm(DenseLayer(l_concat, 96*1*1, nonlinearity=leaky_relu))
-    #l_reshape = ReshapeLayer(l_dense, (-1, 96, 1, 1))
-    deconv_layer = l_concat
-    nf=64
-    for i in range(3, 0, -1):
-        deconv_layer = batch_norm(
-            Deconv2DLayer(deconv_layer, filter_size=3, num_filters=i*64, stride=2, nonlinearity=leaky_relu)
-        )
-    deconv_layer = Deconv2DLayer(
-        deconv_layer, filter_size=4, num_filters=1, stride=2, crop=2, nonlinearity=sigmoid)
-    return {"l_in_enc": l_in_enc, "l_in_feat": l_in_feat, "out": deconv_layer}
-
-def discriminator():
-    l_in_conv = InputLayer((None,1,28,28))
-    conv_layer = l_in_conv
-    nf=32
-    for i in range(3):
-        conv_layer = batch_norm(Conv2DLayer(
-            conv_layer, num_filters=(i+1)*nf, filter_size=3, stride=2, nonlinearity=leaky_relu))
-    conv_layer = batch_norm(Conv2DLayer(
-        conv_layer, num_filters=(i+1)*nf, filter_size=2, nonlinearity=leaky_relu))
-    l_sigm = DenseLayer(conv_layer, num_units=1, nonlinearity=linear)
-    return l_sigm
-
 class GeneGAN():
     def print_network(self,l_out):
         for layer in get_all_layers(l_out):
@@ -78,8 +28,7 @@ class GeneGAN():
             "" if not hasattr(layer, 'nonlinearity') else layer.nonlinearity
         print "# params:", count_params(l_out)
     def __init__(self,
-                 encoder_fn, decoder_fn,
-                 encoder_params, decoder_params,
+                 generator_fn, generator_params, 
                  discriminator_fn, discriminator_params,
                  im_shp=(1,28,28),
                  lambda_recon=1.,
@@ -88,13 +37,10 @@ class GeneGAN():
         self.im_shp = im_shp
         self.verbose = verbose
         # get the networks for the p2p network
-        dd = encoder(**encoder_params)
-        dd['dummy_out'] = ConcatLayer( [dd['l_enc'], dd['l_feat']] )
-        dd_dec = decoder(**decoder_params)
-        self.latent_dim = dd['l_feat'].output_shape[-1]
+        dd = generator_fn(**generator_params)
+        self.latent_dim = dd['l_feat'].output_shape[1::]
         if verbose:
-            self.print_network(dd['dummy_out'])
-            self.print_network(dd_dec['out']) # TODO: concat
+            self.print_network(dd['out'])
         Au = T.tensor4('Au')
         B0 = T.tensor4('B0')
         a = T.tensor4('a') # let the user input their own latent vector
@@ -103,25 +49,24 @@ class GeneGAN():
         else:
             adv_loss = binary_crossentropy
         # generative stuff for Au
-        A_for_Au, u_for_Au = get_output([dd['l_enc'], dd['l_feat']], Au)
+        A_for_Au, u_for_Au, decode_into_Au = get_output([dd['l_enc'], dd['l_feat'], dd['out']], Au)
         # **det stuff**
         A_for_Au_det, u_for_Au_det = get_output([dd['l_enc'], dd['l_feat']], Au, deterministic=True)
-        # *************
-        decode_into_Au = get_output(
-            dd_dec['out'], 
-            {dd_dec['l_in_enc']: A_for_Au, dd_dec['l_in_feat']: u_for_Au}
-        )
         decode_into_A0 = get_output(
-            dd_dec['out'],
-            {dd_dec['l_in_enc']: A_for_Au, dd_dec['l_in_feat']: T.zeros_like(u_for_Au)}
-        )
+            dd['out'],
+            {dd['l_in']: Au, dd['l_feat']: T.zeros_like(u_for_Au)}
+        ) # X_{Au} --> [A,u] --> [A,0] --> X_{A0}
+        decode_into_A0_det = get_output(
+            dd['out'],
+            {dd['l_in']: Au, dd['l_feat']: T.zeros_like(u_for_Au)}, deterministic=True
+        ) # X_{Au} --> [A,u] --> [A,0] --> X_{A0} (DET)
         decode_into_Au_using_a = get_output(
-            dd_dec['out'], 
-            {dd_dec['l_in_enc']: A_for_Au, dd_dec['l_in_feat']: a}
-        )
+            dd['out'], 
+            {dd['l_in']: Au, dd['l_feat']: a}
+        ) # X_{Au} --> [A,u] --> inject own u' --> [A,u'] --> X_{Au'}
         Au_recon_loss = T.abs_(decode_into_Au - Au).mean()
         # discriminator stuff for Au
-        disc = discriminator(**discriminator_params)
+        disc = discriminator_fn(**discriminator_params)
         if verbose:
             self.print_network(disc)
         disc_for_A0 = get_output(disc, decode_into_A0)
@@ -133,18 +78,18 @@ class GeneGAN():
         # **Total loss: reconstruction error + GAN loss to distinguish A0 (fake) and B0 (real)**
         total_generator_loss = A0_generator_loss + lambda_recon*Au_recon_loss
         # generative stuff for B0
-        B_for_B0, eps_for_B0 = get_output([dd['l_enc'], dd['l_feat']], B0)
+        B_for_B0, eps_for_B0 = get_output([dd['l_enc'], dd['l_feat']], {dd['l_in']: B0})
         decode_into_Bu = get_output(
-            dd_dec['out'], 
-            {dd_dec['l_in_enc']: B_for_B0, dd_dec['l_in_feat']: u_for_Au}
-        )
+            dd['out'],
+            {dd['l_in']: B0, dd['l_feat']: u_for_Au}
+        ) # X_{B0} --> [B,0] --> inject u from X_{Au} --> [B,u] --> X_{Bu}
         decode_into_B0 = get_output(
-            dd_dec['out'], 
-            {dd_dec['l_in_enc']: B_for_B0, dd_dec['l_in_feat']: T.zeros_like(u_for_Au)}
+            dd['out'], 
+            {dd['l_in']: B0, dd['l_feat']: T.zeros_like(u_for_Au)}
         )
         eps_loss = T.abs_(eps_for_B0).mean()
         B0_recon_loss = T.abs_(decode_into_B0 - B0).mean()
-        disc2 = discriminator(**discriminator_params)
+        disc2 = discriminator_fn(**discriminator_params)
         disc_for_Au = get_output(disc2, decode_into_Au)
         disc_for_Bu = get_output(disc2, decode_into_Bu)
         # the discriminator returns the probability the image
@@ -158,9 +103,7 @@ class GeneGAN():
         # TOTAL GENERATOR LOSS
         total_loss = total_generator_loss + total_generator_loss_2
         # -----------------------------
-        gen_params = get_all_params(dd['dummy_out'], trainable=True)
-        disc_params = get_all_params(dd_dec['out'], trainable=True)
-        tot_gen_params = gen_params + disc_params
+        tot_gen_params = get_all_params(dd['out'], trainable=True)
         disc1_params = get_all_params(disc, trainable=True)
         disc2_params = get_all_params(disc2, trainable=True)
         gen_updates = opt(total_loss, tot_gen_params, **opt_args)
@@ -178,6 +121,7 @@ class GeneGAN():
         self.dec_fn = None
         # decompose Au into [A,0] then automatically decode
         self.zero_fn = theano.function([Au], decode_into_A0)
+        self.zero_fn_det = theano.function([Au], decode_into_A0_det)
         # decompose Au into [A,0], replace 0 with a (input into the function),
         # then decode
         self.dec_use_a_fn = theano.function([Au, a], decode_into_Au_using_a)
@@ -185,13 +129,13 @@ class GeneGAN():
         self.lr = opt_args['learning_rate']
         self.train_keys = ['A0_gen', 'Bu_gen', 'Au_recon', 'B0_recon', 'eps', 'gen_tot', 'B0_A0_disc', 'Au_Bu_disc'] # TODO:
         self.dd = dd
-        self.dd_dec = dd_dec
+        #self.dd_dec = dd_dec
         self.disc = disc
         self.disc2 = disc2
     def save_model(self, filename):
         with gzip.open(filename, "wb") as g:
             pickle.dump({
-                'gen': get_all_param_values(self.dd['dummy_out']),
+                'gen': get_all_param_values(self.dd['out']),
                 'disc': get_all_param_values(self.disc),
                 'disc2':get_all_params(self.disc2)
             }, g, pickle.HIGHEST_PROTOCOL )
@@ -203,9 +147,9 @@ class GeneGAN():
         """
         with gzip.open(filename) as g:
             dd = pickle.load(g)
-            set_all_param_values(self.dd['dummy_out'], dd['gen'])
-            set_all_param_values(self.dd['disc'], dd['disc'])
-            set_all_param_values(self.dd['disc2'], dd['disc2'])
+            set_all_param_values(self.dd['out'], dd['gen'])
+            set_all_param_values(self.disc['disc'], dd['disc'])
+            set_all_param_values(self.disc2['disc2'], dd['disc2'])
             
     def train(self, it_train, it_val, batch_size, num_epochs, out_dir, model_dir=None, save_every=10, resume=False, reduce_on_plateau=False, schedule={}, quick_run=False):
         def _loop(fn, itr):
@@ -232,9 +176,9 @@ class GeneGAN():
         if self.verbose:
             try:
                 from nolearn.lasagne.visualize import draw_to_file
-                draw_to_file(get_all_layers(self.atob['dummy_out']), "%s/gen.png" % out_dir, verbose=True)
-                draw_to_file(get_all_layers(self.atob['disc']), "%s/disc.png" % out_dir, verbose=True)
-                draw_to_file(get_all_layers(self.btoa['disc2']), "%s/disc2.png" % out_dir, verbose=True)
+                draw_to_file(get_all_layers(self.dd['out']), "%s/gen.png" % out_dir, verbose=True)
+                draw_to_file(get_all_layers(self.disc), "%s/disc.png" % out_dir, verbose=True)
+                draw_to_file(get_all_layers(self.disc2), "%s/disc2.png" % out_dir, verbose=True)
             except:
                 pass
         f = open("%s/results.txt" % out_dir, "a" if resume else "wb")
@@ -274,19 +218,13 @@ class GeneGAN():
             self.plot(it_train, "%s/add_%i.png" % (dump_train,e+1), mode='add')
             self.plot(it_val, "%s/remove_%i.png" % (dump_valid,e+1), mode='remove')
             self.plot(it_val, "%s/add_%i.png" % (dump_valid,e+1), mode='add')
-            """
-            # plot nice grids
-            plot_grid("%s/atob_%i.png" % (out_dir,e+1), it_val, self.atob_fn, invert=False, is_a_grayscale=self.is_a_grayscale, is_b_grayscale=self.is_b_grayscale)
-            plot_grid("%s/btoa_%i.png" % (out_dir,e+1), it_val, self.btoa_fn, invert=True, is_a_grayscale=self.is_a_grayscale, is_b_grayscale=self.is_b_grayscale)
-            # plot big pictures of predict(A) in the valid set
-            self.generate_atobs(it_train, 1, batch_size, "%s/dump_train" % out_dir, deterministic=False)
-            self.generate_atobs(it_val, 1, batch_size, "%s/dump_valid" % out_dir, deterministic=False)
-            """
             if model_dir != None and (e+1) % save_every == 0:
                 self.save_model("%s/%i.model" % (model_dir, e+1))
 
-    def plot(self, itr, out_file, grid_size=10, mode='remove'):
+    def plot(self, itr, out_file, grid_size=10, mode='remove', deterministic=True):
         assert mode in ['remove', 'add']
+        zero_fn = self.zero_fn if not deterministic else self_zero_fn_det
+        enc_fn = self.enc_fn if not deterministic else self.enc_fn_det
         # remove = decompose Au into [A,u], change u -> 0 then decode
         # add = decompose B0 into [B,0], change 0 -> randomly sampled u then decode
         im_dim = self.im_shp[-1]
@@ -296,14 +234,14 @@ class GeneGAN():
                 this_Au, this_B0 = itr.next()
                 if mode == 'remove':
                     # ok, go from Au to A0
-                    target = self.zero_fn(this_Au)
+                    target = zero_fn(this_Au)
                 else:
                     # ok, go from B0 to Ba
                     # TODO: figure out bottleneck size
                     #a_fake = floatX(np.random.normal(0,1,size=(this_B0.shape[0],self.latent_dim)))
                     #a_actual = a_fake
                     # get from real latent factors from the Au data
-                    _, a_actual = self.enc_fn(this_Au)
+                    _, a_actual = enc_fn(this_Au)
                     # then use those to replace the '0' factor for B0
                     target = self.dec_use_a_fn(this_B0, a_actual)
                 grid[i*im_dim:(i+1)*im_dim, j*im_dim:(j+1)*im_dim, :] = target[0].swapaxes(0,1).swapaxes(1,2)
@@ -312,48 +250,62 @@ class GeneGAN():
             imsave(arr=grid[:,:,0],fname=out_file)
         else:
             imsave(arr=grid,fname=out_file)
-
-                
-class MnistIterator():
-    def _iterator(self,X_Au, X_B0, bs, shuffle):
-        while True:
-            if shuffle:
-                np.random.shuffle(X_Au)
-                np.random.shuffle(X_B0)
-            for b in range(self.N // bs):
-                yield X_Au[b*bs:(b+1)*bs], X_B0[b*bs:(b+1)*bs]
-    def __init__(self, mode, c1, c2, bs, shuffle):
-        assert mode in ['train', 'valid']
-        from load_mnist import load_dataset
-        X_train, y_train, X_valid, y_valid, _, _ = load_dataset()
-        if mode == 'train':
-            X_Au = X_train[y_train == c1]
-            X_B0 = X_train[y_train == c2]
-        else:
-            X_Au = X_valid[y_valid == c1]
-            X_B0 = X_valid[y_valid == c2]            
-        self.fn = self._iterator(X_Au, X_B0, bs, shuffle)
-        self.N = min(X_Au.shape[0], X_B0.shape[0])
-    def __iter__(self):
-        return self
-    def next(self):
-        return self.fn.next()
-            
+                           
 if __name__ == '__main__':
 
-    itr_train = MnistIterator('train',9,0,32,True)
-    itr_valid = MnistIterator('valid',9,0,32,True)
-    # lr
-    encode_decode_params = {'enc_size':64, 'feat_size':64}
-    model = GeneGAN(
-        encoder_fn=encoder,
-        decoder_fn=decoder,
-        encoder_params=encode_decode_params,
-        decoder_params=encode_decode_params,
-        discriminator_fn=discriminator,
-        discriminator_params={},
-        opt_args={'learning_rate':theano.shared(floatX(2e-4))})
-    name = "deleteme_64c_pgram"
-    model.train(it_train=itr_train, it_val=itr_valid, batch_size=128, num_epochs=1000,
-                out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={300: 2e-5})
+    def _preset(seed):
+        lasagne.random.set_rng( np.random.RandomState(seed) )
+        np.random.seed(seed)        
 
+    def get_dr_iterators(batch_size):
+        from iterators import BasicHdf5Iterator
+        dr_h5 = "/data/lisatmp4/beckhamc/hdf5/dr.h5"
+        dataset = h5py.File(dr_h5,"r")
+        imgen = ImageDataGenerator(horizontal_flip=True, vertical_flip=True)
+        it_train = BasicHdf5Iterator(X=dataset['xt'], y=dataset['yt'],
+                                     bs=batch_size, imgen=imgen, c1=0, c2=4,
+                                     rnd_state=np.random.RandomState(0),
+                                     tanh_norm=True)
+        it_val = BasicHdf5Iterator(X=dataset['xv'], y=dataset['yv'],
+                                     bs=batch_size, imgen=imgen, c1=0, c2=4,
+                                     rnd_state=np.random.RandomState(0),
+                                     tanh_norm=True)
+        return it_train, it_val
+        
+    def mnist(mode,seed):
+        _preset(seed)
+        itr_train = MnistIterator('train',9,0,32,True)
+        itr_valid = MnistIterator('valid',9,0,32,True)
+        # lr
+        encode_decode_params = {'enc_size':64, 'feat_size':64}
+        model = GeneGAN(
+            generator_fn=mnist_encoder,
+            generator_params=encode_decode_params,
+            discriminator_fn=mnist_discriminator,
+            discriminator_params={},
+            opt_args={'learning_rate':theano.shared(floatX(2e-4))})
+        name = "deleteme_64c_repeat"
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=128, num_epochs=1000,
+                out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={300: 2e-5})
+    
+    def dr(mode,seed):
+        from architectures import g_unet_256, discriminator
+        _preset(seed)
+        bs = 16
+        itr_train, itr_valid = get_dr_iterators(bs)
+        model = GeneGAN(
+            generator_fn=g_unet_256,
+            generator_params={},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': (3,256,256)},
+            opt_args={'learning_rate':theano.shared(floatX(2e-4))})
+        name = "dr_test1"
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={300: 2e-5})
+        
+        
+    locals()[ sys.argv[1] ](sys.argv[2], int(sys.argv[3]))
+
+    
