@@ -7,7 +7,7 @@ leaky_relu = LeakyRectify(0.2)
 from lasagne.init import *
 from lasagne.updates import *
 from lasagne.objectives import *
-from keras.preprocessing.image import ImageDataGenerator
+from layers import BilinearUpsample2DLayer
 
 def mnist_encoder():
     # TODO: enc/feat size not used

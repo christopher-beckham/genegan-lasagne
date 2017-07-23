@@ -18,6 +18,7 @@ import nolearn
 import pickle
 import sys
 import gzip
+from util import plot_grid
 
 #from util import iterate_hdf5, Hdf5Iterator, convert_to_rgb, compose_imgs, plot_grid
 
@@ -30,7 +31,7 @@ class GeneGAN():
     def __init__(self,
                  generator_fn, generator_params, 
                  discriminator_fn, discriminator_params,
-                 im_shp=(1,28,28),
+                 im_shp,
                  lambda_recon=1.,
                  opt=adam, opt_args={'learning_rate':theano.shared(floatX(1e-3))},
                  reconstruction='l1', lsgan=True, verbose=True):
@@ -125,6 +126,8 @@ class GeneGAN():
         # decompose Au into [A,0], replace 0 with a (input into the function),
         # then decode
         self.dec_use_a_fn = theano.function([Au, a], decode_into_Au_using_a)
+        #
+        self.out_fn = theano.function([Au], decode_into_Au)
         # ------------
         self.lr = opt_args['learning_rate']
         self.train_keys = ['A0_gen', 'Bu_gen', 'Au_recon', 'B0_recon', 'eps', 'gen_tot', 'B0_A0_disc', 'Au_Bu_disc'] # TODO:
@@ -156,6 +159,7 @@ class GeneGAN():
             rec = [ [] for i in range(len(self.train_keys)) ]
             for b in range(itr.N // batch_size):
                 A_batch, B_batch = it_train.next()
+                print A_batch.shape, B_batch.shape
                 results = fn(A_batch,B_batch)
                 for i in range(len(results)):
                     rec[i].append(results[i])
@@ -218,20 +222,29 @@ class GeneGAN():
             self.plot(it_train, "%s/add_%i.png" % (dump_train,e+1), mode='add')
             self.plot(it_val, "%s/remove_%i.png" % (dump_valid,e+1), mode='remove')
             self.plot(it_val, "%s/add_%i.png" % (dump_valid,e+1), mode='add')
+            is_grayscale = True if self.im_shp[0]==1 else False
+            plot_grid("%s/Au_recon_%i.png" % (out_dir,e+1), it_val, self.out_fn,
+                      is_a_grayscale=is_grayscale, is_b_grayscale=is_grayscale)
             if model_dir != None and (e+1) % save_every == 0:
                 self.save_model("%s/%i.model" % (model_dir, e+1))
 
     def plot(self, itr, out_file, grid_size=10, mode='remove', deterministic=True):
         assert mode in ['remove', 'add']
-        zero_fn = self.zero_fn if not deterministic else self_zero_fn_det
+        zero_fn = self.zero_fn if not deterministic else self.zero_fn_det
         enc_fn = self.enc_fn if not deterministic else self.enc_fn_det
         # remove = decompose Au into [A,u], change u -> 0 then decode
         # add = decompose B0 into [B,0], change 0 -> randomly sampled u then decode
         im_dim = self.im_shp[-1]
-        grid = np.zeros((im_dim*grid_size, im_dim*grid_size, self.im_shp[0]), dtype="float32")
+        grid = floatX(np.zeros((im_dim*grid_size, im_dim*grid_size, self.im_shp[0])))
+        this_Au, this_B0 = itr.next()
+        ctr = 0
         for i in range(grid_size):
             for j in range(grid_size):
-                this_Au, this_B0 = itr.next()
+                if ctr == itr.bs:
+                    # if we've used all the imgs in the batch, get a fresh new batch
+                    this_Au, this_B0 = itr.next()
+                    print this_Au.shape, this_B0.shape
+                    ctr = 0
                 if mode == 'remove':
                     # ok, go from Au to A0
                     target = zero_fn(this_Au)
@@ -241,10 +254,13 @@ class GeneGAN():
                     #a_fake = floatX(np.random.normal(0,1,size=(this_B0.shape[0],self.latent_dim)))
                     #a_actual = a_fake
                     # get from real latent factors from the Au data
-                    _, a_actual = enc_fn(this_Au)
+                    #import pdb
+                    #pdb.set_trace()
+                    _, u_actual = enc_fn(this_Au)
                     # then use those to replace the '0' factor for B0
-                    target = self.dec_use_a_fn(this_B0, a_actual)
-                grid[i*im_dim:(i+1)*im_dim, j*im_dim:(j+1)*im_dim, :] = target[0].swapaxes(0,1).swapaxes(1,2)
+                    target = self.dec_use_a_fn(this_B0, u_actual)
+                grid[i*im_dim:(i+1)*im_dim, j*im_dim:(j+1)*im_dim, :] = target[ctr].swapaxes(0,1).swapaxes(1,2)
+                ctr += 1
         from skimage.io import imsave
         if self.im_shp[0]==1:
             imsave(arr=grid[:,:,0],fname=out_file)
@@ -258,16 +274,18 @@ if __name__ == '__main__':
         np.random.seed(seed)        
 
     def get_dr_iterators(batch_size):
-        from iterators import BasicHdf5Iterator
+        from iterators import Hdf5TwoClassIterator
         dr_h5 = "/data/lisatmp4/beckhamc/hdf5/dr.h5"
         dataset = h5py.File(dr_h5,"r")
         imgen = ImageDataGenerator(horizontal_flip=True, vertical_flip=True)
-        it_train = BasicHdf5Iterator(X=dataset['xt'], y=dataset['yt'],
-                                     bs=batch_size, imgen=imgen, c1=0, c2=4,
+        # c1 has latent factor of interest, i.e. Au
+        # c2 doesn't have factor of interest, i.e. B0
+        it_train = Hdf5TwoClassIterator(X=dataset['xt'], y=dataset['yt'],
+                                     bs=batch_size, imgen=imgen, c1=4, c2=0,
                                      rnd_state=np.random.RandomState(0),
                                      tanh_norm=True)
-        it_val = BasicHdf5Iterator(X=dataset['xv'], y=dataset['yv'],
-                                     bs=batch_size, imgen=imgen, c1=0, c2=4,
+        it_val = Hdf5TwoClassIterator(X=dataset['xv'], y=dataset['yv'],
+                                     bs=batch_size, imgen=imgen, c1=4, c2=0,
                                      rnd_state=np.random.RandomState(0),
                                      tanh_norm=True)
         return it_train, it_val
@@ -289,22 +307,44 @@ if __name__ == '__main__':
             model.train(it_train=itr_train, it_val=itr_valid, batch_size=128, num_epochs=1000,
                 out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={300: 2e-5})
     
-    def dr(mode,seed):
+    def dr2(mode,seed):
         from architectures import g_unet_256, discriminator
         _preset(seed)
         bs = 16
         itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
         model = GeneGAN(
             generator_fn=g_unet_256,
-            generator_params={},
+            generator_params={'nf':64, 'act':tanh, 'bilinear_upsample':True},
             discriminator_fn=discriminator,
-            discriminator_params={'in_shp': (3,256,256)},
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
             opt_args={'learning_rate':theano.shared(floatX(2e-4))})
-        name = "dr_test1"
+        name = "dr_test2_full"
         if mode == "train":
             model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
-                out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={300: 2e-5})
-        
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={300: 2e-5})
+
+
+    def dr2_l10(mode,seed):
+        from architectures import g_unet_256, discriminator
+        _preset(seed)
+        bs = 16
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        model = GeneGAN(
+            generator_fn=g_unet_256,
+            generator_params={'nf':64, 'act':tanh, 'bilinear_upsample':True},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            opt_args={'learning_rate':theano.shared(floatX(2e-4))})
+        name = "dr_test2_l10_full"
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={300: 2e-5})
+
         
     locals()[ sys.argv[1] ](sys.argv[2], int(sys.argv[3]))
 
