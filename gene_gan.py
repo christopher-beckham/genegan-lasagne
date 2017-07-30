@@ -13,14 +13,10 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from time import time
-import nolearn
-#from keras_ports import ReduceLROnPlateau
 import pickle
 import sys
 import gzip
-from util import plot_grid
-
-#from util import iterate_hdf5, Hdf5Iterator, convert_to_rgb, compose_imgs, plot_grid
+from util import plot_grid, convert_to_rgb
 
 class GeneGAN():
     def print_network(self,l_out):
@@ -33,6 +29,7 @@ class GeneGAN():
                  discriminator_fn, discriminator_params,
                  im_shp,
                  lambda_recon=1.,
+                 pgram_coef=0.,
                  opt=adam, opt_args={'learning_rate':theano.shared(floatX(1e-3))},
                  reconstruction='l1', lsgan=True, verbose=True):
         self.im_shp = im_shp
@@ -78,6 +75,7 @@ class GeneGAN():
         A0_generator_loss = adv_loss(disc_for_A0, 1.).mean()
         # **Total loss: reconstruction error + GAN loss to distinguish A0 (fake) and B0 (real)**
         total_generator_loss = A0_generator_loss + lambda_recon*Au_recon_loss
+        
         # generative stuff for B0
         B_for_B0, eps_for_B0 = get_output([dd['l_enc'], dd['l_feat']], {dd['l_in']: B0})
         decode_into_Bu = get_output(
@@ -86,7 +84,7 @@ class GeneGAN():
         ) # X_{B0} --> [B,0] --> inject u from X_{Au} --> [B,u] --> X_{Bu}
         decode_into_B0 = get_output(
             dd['out'], 
-            {dd['l_in']: B0, dd['l_feat']: T.zeros_like(u_for_Au)}
+            {dd['l_in']: B0, dd['l_feat']: T.zeros_like(eps_for_B0)}
         )
         eps_loss = T.abs_(eps_for_B0).mean()
         B0_recon_loss = T.abs_(decode_into_B0 - B0).mean()
@@ -98,11 +96,13 @@ class GeneGAN():
         disc_2_loss = adv_loss(disc_for_Au, 1.).mean() + adv_loss(disc_for_Bu, 0.).mean()
         Bu_generator_loss = adv_loss(disc_for_Bu, 1.).mean()
         # **Total loss: reconstruction error + GAN loss to distinguish Bu (fake) and Au (real)**
-        total_generator_loss_2 = Bu_generator_loss + lambda_recon*B0_recon_loss + eps_loss
+        total_generator_loss_2 = Bu_generator_loss + lambda_recon*B0_recon_loss
         # parallelogram loss
-        #pgram_loss = T.abs_(Au + B0 - decode_into_A0 - decode_into_Bu).mean()*0.01
         # TOTAL GENERATOR LOSS
-        total_loss = total_generator_loss + total_generator_loss_2
+        total_loss = total_generator_loss + total_generator_loss_2 + eps_loss
+        pgram_loss = T.abs_(Au + B0 - decode_into_A0 - decode_into_Bu).mean()
+        if pgram_coef > 0.:
+            total_loss += pgram_coef*pgram_loss
         # -----------------------------
         tot_gen_params = get_all_params(dd['out'], trainable=True)
         disc1_params = get_all_params(disc, trainable=True)
@@ -110,7 +110,7 @@ class GeneGAN():
         gen_updates = opt(total_loss, tot_gen_params, **opt_args)
         gen_updates.update(opt(disc_1_loss, disc1_params, **opt_args))
         gen_updates.update(opt(disc_2_loss, disc2_params, **opt_args))
-        keys = [A0_generator_loss, Bu_generator_loss, Au_recon_loss, B0_recon_loss, eps_loss, total_loss, disc_1_loss, disc_2_loss]
+        keys = [A0_generator_loss, Bu_generator_loss, Au_recon_loss, B0_recon_loss, eps_loss, pgram_loss, total_loss, disc_1_loss, disc_2_loss]
         self.train_fn = theano.function([Au, B0], keys, updates=gen_updates)
         self.loss_fn = theano.function([Au, B0], keys)
         # decompose Au into [A,u]
@@ -130,7 +130,7 @@ class GeneGAN():
         self.out_fn = theano.function([Au], decode_into_Au)
         # ------------
         self.lr = opt_args['learning_rate']
-        self.train_keys = ['A0_gen', 'Bu_gen', 'Au_recon', 'B0_recon', 'eps', 'gen_tot', 'B0_A0_disc', 'Au_Bu_disc'] # TODO:
+        self.train_keys = ['A0_gen', 'Bu_gen', 'Au_recon', 'B0_recon', 'eps', 'pgram', 'gen_tot', 'B0_A0_disc', 'Au_Bu_disc']
         self.dd = dd
         #self.dd_dec = dd_dec
         self.disc = disc
@@ -140,7 +140,7 @@ class GeneGAN():
             pickle.dump({
                 'gen': get_all_param_values(self.dd['out']),
                 'disc': get_all_param_values(self.disc),
-                'disc2':get_all_params(self.disc2)
+                'disc2':get_all_param_values(self.disc2)
             }, g, pickle.HIGHEST_PROTOCOL )
     def load_model(self, filename):
         """
@@ -151,10 +151,14 @@ class GeneGAN():
         with gzip.open(filename) as g:
             dd = pickle.load(g)
             set_all_param_values(self.dd['out'], dd['gen'])
-            set_all_param_values(self.disc['disc'], dd['disc'])
-            set_all_param_values(self.disc2['disc2'], dd['disc2'])
+            set_all_param_values(self.disc, dd['disc'])
+            #disc2_params = [ elem.get_value() for elem in dd['disc2'] ]
+            #set_all_param_values(self.disc2, disc2_params)
+            set_all_param_values(self.disc2, dd['disc2'])
             
-    def train(self, it_train, it_val, batch_size, num_epochs, out_dir, model_dir=None, save_every=10, resume=False, reduce_on_plateau=False, schedule={}, quick_run=False):
+    def train(self, it_train, it_val, batch_size, num_epochs,
+              out_dir, model_dir=None, save_every=10,
+              max_imgs=10, resume=False, reduce_on_plateau=False, schedule={}, quick_run=False):
         def _loop(fn, itr):
             rec = [ [] for i in range(len(self.train_keys)) ]
             for b in range(itr.N // batch_size):
@@ -215,27 +219,35 @@ class GeneGAN():
             f.write("%s\n" % out_str); f.flush()
             dump_train = "%s/dump_train" % out_dir
             dump_valid = "%s/dump_valid" % out_dir
-            for path in [dump_train, dump_valid]:
+            dump_Au = "%s/dump_Au" % out_dir
+            dump_B0 = "%s/dump_B0" % out_dir
+            for path in [dump_train, dump_valid, dump_Au, dump_B0]:
                 if not os.path.exists(path):
                     os.makedirs(path)
-            self.plot(it_train, "%s/remove_%i.png" % (dump_train,e+1), mode='remove')
-            self.plot(it_train, "%s/add_%i.png" % (dump_train,e+1), mode='add')
-            self.plot(it_val, "%s/remove_%i.png" % (dump_valid,e+1), mode='remove')
-            self.plot(it_val, "%s/add_%i.png" % (dump_valid,e+1), mode='add')
+            self.plot(it_train, dump_train, (e+1) % max_imgs, mode='remove')
+            self.plot(it_train, dump_train, (e+1) % max_imgs, mode='add')
+            self.plot(it_val, dump_valid, (e+1) % max_imgs, mode='remove')
+            self.plot(it_val, dump_valid, (e+1) % max_imgs, mode='add')
             is_grayscale = True if self.im_shp[0]==1 else False
-            plot_grid("%s/Au_recon_%i.png" % (out_dir,e+1), it_val, self.out_fn,
+            plot_grid("%s/Au_recon_%i.png" % (dump_Au, (e+1) % max_imgs), it_val, self.out_fn,
                       is_a_grayscale=is_grayscale, is_b_grayscale=is_grayscale)
+            plot_grid("%s/B0_recon_%i.png" % (dump_B0, (e+1) % max_imgs), it_val, self.out_fn,
+                      is_a_grayscale=is_grayscale, is_b_grayscale=is_grayscale, swap=True)
             if model_dir != None and (e+1) % save_every == 0:
                 self.save_model("%s/%i.model" % (model_dir, e+1))
 
-    def plot(self, itr, out_file, grid_size=10, mode='remove', deterministic=True):
+    def plot(self, itr, out_dir, epoch, grid_size=10, mode='remove', deterministic=True):
         assert mode in ['remove', 'add']
         zero_fn = self.zero_fn if not deterministic else self.zero_fn_det
         enc_fn = self.enc_fn if not deterministic else self.enc_fn_det
         # remove = decompose Au into [A,u], change u -> 0 then decode
         # add = decompose B0 into [B,0], change 0 -> randomly sampled u then decode
         im_dim = self.im_shp[-1]
+        is_grayscale = True if self.im_shp[0]==1 else False
+        # grid with transformed images
         grid = floatX(np.zeros((im_dim*grid_size, im_dim*grid_size, self.im_shp[0])))
+        # grid with ground truth images
+        grid_gt = np.zeros_like(grid)
         this_Au, this_B0 = itr.next()
         ctr = 0
         for i in range(grid_size):
@@ -248,6 +260,8 @@ class GeneGAN():
                 if mode == 'remove':
                     # ok, go from Au to A0
                     target = zero_fn(this_Au)
+                    # if we're doing 'remove', the ground truth is actually Au
+                    grid_gt[i*im_dim:(i+1)*im_dim, j*im_dim:(j+1)*im_dim, :] = convert_to_rgb(this_Au[ctr],is_grayscale)
                 else:
                     # ok, go from B0 to Ba
                     # TODO: figure out bottleneck size
@@ -259,13 +273,19 @@ class GeneGAN():
                     _, u_actual = enc_fn(this_Au)
                     # then use those to replace the '0' factor for B0
                     target = self.dec_use_a_fn(this_B0, u_actual)
-                grid[i*im_dim:(i+1)*im_dim, j*im_dim:(j+1)*im_dim, :] = target[ctr].swapaxes(0,1).swapaxes(1,2)
+                    # if we're doing 'add', the ground truth is actually B0
+                    grid_gt[i*im_dim:(i+1)*im_dim, j*im_dim:(j+1)*im_dim, :] = convert_to_rgb(this_B0[ctr],is_grayscale)
+                grid[i*im_dim:(i+1)*im_dim, j*im_dim:(j+1)*im_dim, :] = convert_to_rgb(target[ctr],is_grayscale)
                 ctr += 1
         from skimage.io import imsave
+        filename = "%s/%s_%i.png" % (out_dir, mode, epoch)
+        filename_gt = "%s/%s_%i_gt.png" % (out_dir, mode, epoch)
         if self.im_shp[0]==1:
-            imsave(arr=grid[:,:,0],fname=out_file)
+            imsave(arr=grid[:,:,0],fname=filename)
+            imsave(arr=grid_gt[:,:,0],fname=filename_gt)
         else:
-            imsave(arr=grid,fname=out_file)
+            imsave(arr=grid,fname=filename)
+            imsave(arr=grid_gt,fname=filename_gt)
                            
 if __name__ == '__main__':
 
@@ -332,6 +352,8 @@ if __name__ == '__main__':
         bs = 16
         itr_train, itr_valid = get_dr_iterators(bs)
         im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-5
         model = GeneGAN(
             generator_fn=g_unet_256,
             generator_params={'nf':64, 'act':tanh, 'bilinear_upsample':True},
@@ -339,13 +361,498 @@ if __name__ == '__main__':
             discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
             im_shp=im_shp,
             lambda_recon=10.,
-            opt_args={'learning_rate':theano.shared(floatX(2e-4))})
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
         name = "dr_test2_l10_full"
+        model.load_model("models/%s/140.model.bak2" % name)
         if mode == "train":
             model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
-                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={300: 2e-5})
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True)
 
-        
+    def dr2_l10_u01(mode,seed):
+        from architectures import g_unet_256, discriminator
+        _preset(seed)
+        bs = 16
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-5
+        model = GeneGAN(
+            generator_fn=g_unet_256,
+            generator_params={'nf':64, 'act':tanh, 'bilinear_upsample':True, 'u_split':0.1},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l10_full_u01"
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True)
+
+    def dr2_l10_u05(mode,seed):
+        from architectures import g_unet_256, discriminator
+        _preset(seed)
+        bs = 16
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-5
+        model = GeneGAN(
+            generator_fn=g_unet_256,
+            generator_params={'nf':64, 'act':tanh, 'bilinear_upsample':True, 'u_split':0.5},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l10_full_u05"
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True)
+
+    def dr2_l10_beefier_u05(mode,seed):
+        from architectures import g_unet_256, discriminator
+        _preset(seed)
+        bs = 16
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=g_unet_256,
+            generator_params={'nf':64, 'act':tanh, 'bilinear_upsample':True, 'u_split':0.5, 'mul_factor':[1,2,4,8,8,8,16,16]},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l10_full_beefier_u05_2e-4"
+        model.load_model("models/%s/10.model.bak" % name)
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True, save_every=20)
+
+
+    def dr2_l10_beefier_u05_pgram001(mode,seed):
+        from architectures import g_unet_256, discriminator
+        _preset(seed)
+        bs = 16
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=g_unet_256,
+            generator_params={'nf':64, 'act':tanh, 'bilinear_upsample':True, 'u_split':0.5, 'mul_factor':[1,2,4,8,8,8,16,16]},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            pgram_coef=0.01,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l10_full_beefier_u05_2e-4_pgram0.01"
+        # todo: examine feature map #'s
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True, save_every=20)
+
+    def dr2_l10_beefier_u05_pgram001_d09b(mode,seed):
+        from architectures import g_unet_256, discriminator
+        _preset(seed)
+        bs = 16
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=g_unet_256,
+            generator_params={'nf':64, 'act':tanh, 'bilinear_upsample':True, 'u_split':0.5, 'mul_factor':[1,2,4,8,8,8,16,16], 'dropout':0.9},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            pgram_coef=0.01,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l10_full_beefier_u05_2e-4_pgram0.01_d0.9b"
+        # todo: examine feature map #'s
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True, save_every=20)
+
+
+    def dr2_l10_beefier_u05_pgram001_basic3r2(mode,seed):
+        from architectures import net_256_2, discriminator
+        _preset(seed)
+        bs = 8
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=net_256_2,
+            generator_params={'nf':128, 'act':tanh, 'u_split':0.5, 'num_repeats':2},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            pgram_coef=0.01,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l10_full_beefier_u05_2e-4_pgram0.01_basic3r2"
+        # todo: examine feature map #'s
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True, save_every=20)
+
+
+    def dr2_l1_beefier_u05_pgram001_basic3r1_bnd(mode,seed):
+        from architectures import net_256_2, discriminator
+        _preset(seed)
+        bs = 8
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=net_256_2,
+            generator_params={'nf':128, 'act':tanh, 'u_split':0.5, 'num_repeats':1},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':True, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=1.,
+            pgram_coef=0.01,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l1_full_beefier_u05_2e-4_pgram0.01_basic3r1_bnd"
+        # todo: examine feature map #'s
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True, save_every=20)
+
+
+
+            
+    def dr2_l10_beefier_u025_pgram001_basic3r2(mode,seed):
+        from architectures import net_256_2, discriminator
+        _preset(seed)
+        bs = 8
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=net_256_2,
+            generator_params={'nf':128, 'act':tanh, 'u_split':0.25, 'num_repeats':2},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            pgram_coef=0.01,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l10_full_beefier_u025_2e-4_pgram0.01_basic3r2"
+        # todo: examine feature map #'s
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True, save_every=20)
+
+
+
+
+
+
+    def dr2_l10_beefier_u025_pgram001_resnet1(mode,seed):
+        from architectures import net_256_2_resblock, discriminator
+        _preset(seed)
+        bs = 8
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=net_256_2_resblock,
+            generator_params={'nf':128, 'act':tanh, 'u_split':0.25 },
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            pgram_coef=0.01,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l10_full_beefier_u025_2e-4_pgram0.01_resnet1"
+        # todo: examine feature map #'s
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True, save_every=20)
+
+
+
+    def dr2_l10_beefier_u025_pgram001_resnet1r1(mode,seed):
+        from architectures import net_256_2_resblock, discriminator
+        _preset(seed)
+        bs = 4
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=net_256_2_resblock,
+            generator_params={'nf':128, 'act':tanh, 'u_split':0.25, 'num_repeats':1 },
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            pgram_coef=0.01,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l10_full_beefier_u025_2e-4_pgram0.01_resnet1r1"
+        # todo: examine feature map #'s
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True, save_every=20)
+
+
+    def dr2_l5_beefier_u025_pgram001_resnet1r1(mode,seed):
+        from architectures import net_256_2_resblock, discriminator
+        _preset(seed)
+        bs = 4
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=net_256_2_resblock,
+            generator_params={'nf':128, 'act':tanh, 'u_split':0.25, 'num_repeats':1 },
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=5.,
+            pgram_coef=0.01,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l5_full_beefier_u025_2e-4_pgram0.01_resnet1r1"
+        # todo: examine feature map #'s
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True, save_every=20)
+
+
+    def dr2_l10_beefier_u025_pgram001_resnet1r1_dbn(mode,seed):
+        from architectures import net_256_2_resblock, discriminator
+        _preset(seed)
+        bs = 4
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=net_256_2_resblock,
+            generator_params={'nf':128, 'act':tanh, 'u_split':0.25, 'num_repeats':1 },
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':True, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            pgram_coef=0.01,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l10_full_beefier_u025_2e-4_pgram0.01_resnet1r1_dbn"
+        # todo: examine feature map #'s
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True, save_every=20)
+
+
+
+    def dr2_l5_beefier_u025_pgram001_resnet1r1_dbn(mode,seed):
+        from architectures import net_256_2_resblock, discriminator
+        _preset(seed)
+        bs = 4
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=net_256_2_resblock,
+            generator_params={'nf':128, 'act':tanh, 'u_split':0.25, 'num_repeats':1 },
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':True, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=5.,
+            pgram_coef=0.01,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l5_full_beefier_u025_2e-4_pgram0.01_resnet1r1_dbn"
+        # todo: examine feature map #'s
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True, save_every=20)
+
+            
+
+    def dr2_l100_beefier_u025_pgram001_resnet1r1(mode,seed):
+        from architectures import net_256_2_resblock, discriminator
+        _preset(seed)
+        bs = 4
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=net_256_2_resblock,
+            generator_params={'nf':128, 'act':tanh, 'u_split':0.25, 'num_repeats':1 },
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=100.,
+            pgram_coef=0.01,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l100_full_beefier_u025_2e-4_pgram0.01_resnet1r1"
+        # todo: examine feature map #'s
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True, save_every=20)
+
+
+
+            
+    def dr2_l10_beefier_u05_pgram001_d09b_bnd(mode,seed):
+        from architectures import g_unet_256, discriminator
+        _preset(seed)
+        bs = 16
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=g_unet_256,
+            generator_params={'nf':64, 'act':tanh, 'bilinear_upsample':True, 'u_split':0.25, 'mul_factor':[1,2,4,8,8,8,16,16], 'dropout':0.9},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':True, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            pgram_coef=0.01,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l10_full_beefier_u05_2e-4_pgram0.01_d0.9b_bnd"
+        # todo: examine feature map #'s
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True, save_every=20)
+            
+            
+            
+    def dr2_l10_beefier_u05_pgram001_d05b_bnd(mode,seed):
+        from architectures import g_unet_256, discriminator
+        _preset(seed)
+        bs = 16
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=g_unet_256,
+            generator_params={'nf':64, 'act':tanh, 'bilinear_upsample':True, 'u_split':0.25, 'mul_factor':[1,2,4,8,8,8,16,16], 'dropout':0.5},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':True, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            pgram_coef=0.01,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l10_full_beefier_u05_2e-4_pgram0.01_d0.5b_bnd"
+        # todo: examine feature map #'s
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True, save_every=20)
+
+
+            
+    def dr2_l10_beefier_u05_pgram001_d06b(mode,seed):
+        from architectures import g_unet_256, discriminator
+        _preset(seed)
+        bs = 16
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=g_unet_256,
+            generator_params={'nf':64, 'act':tanh, 'bilinear_upsample':True, 'u_split':0.5, 'mul_factor':[1,2,4,8,8,8,16,16], 'dropout':0.6},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            pgram_coef=0.01,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l10_full_beefier_u05_2e-4_pgram0.01_d0.6b"
+        # todo: examine feature map #'s
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True, save_every=20)
+
+
+
+            
+    def dr2_l10_beefier_u05_pgram001_noskip(mode,seed):
+        from architectures import g_unet_256, discriminator
+        _preset(seed)
+        bs = 16
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=g_unet_256,
+            generator_params={'nf':64, 'act':tanh, 'bilinear_upsample':True, 'u_split':0.5, 'mul_factor':[1,2,4,8,8,8,16,16], 'disable_skip':True},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            pgram_coef=0.01,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l10_full_beefier_u05_2e-4_pgram0.01_noskip"
+        # todo: examine feature map #'s
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True, save_every=20)
+
+
+            
+    def dr2_l10_beefier_u025(mode,seed):
+        from architectures import g_unet_256, discriminator
+        _preset(seed)
+        bs = 16
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=g_unet_256,
+            generator_params={'nf':64, 'act':tanh, 'bilinear_upsample':True, 'u_split':0.25, 'mul_factor':[1,2,4,8,8,8,16,16]},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_l10_full_beefier_u025"
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={})
+
+            
+            
+    def dr2_u01(mode,seed):
+        from architectures import g_unet_256, discriminator
+        _preset(seed)
+        bs = 16
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        #lr=2e-4
+        lr=2e-5
+        model = GeneGAN(
+            generator_fn=g_unet_256,
+            generator_params={'nf':64, 'act':tanh, 'bilinear_upsample':True, 'u_split':0.1},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=1.,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr_test2_full_u01"
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True)
+
+            
     locals()[ sys.argv[1] ](sys.argv[2], int(sys.argv[3]))
 
     

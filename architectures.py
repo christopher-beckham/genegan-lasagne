@@ -65,15 +65,191 @@ def Convolution(layer, f, k=3, s=2, border_mode='same', **kwargs):
 def Deconvolution(layer, f, k=2, s=2, **kwargs):
     return Deconv2DLayer(layer, num_filters=f, filter_size=(k,k), stride=(s,s), nonlinearity=linear)
 
-def UpsampleBilinear(layer, f):
-    layer = BilinearUpsample2DLayer(layer, 2)
+def UpsampleBilinear(layer, f, s=2):
+    layer = BilinearUpsample2DLayer(layer, s)
     layer = Convolution(layer, f, s=1)
     return layer
 
 def concatenate_layers(layers, **kwargs):
     return ConcatLayer(layers, axis=1)
 
-def g_unet_256(nf=64, act=tanh, dropout=0., bilinear_upsample=False):
+def resblock(layer, nf, s=1, decode=False):
+    left = layer
+    if not decode:
+        left = Convolution(left, f=nf, s=s)
+    else:
+        # upsample using bilinear sampling using the
+        # custom stride and have the conv's s=1
+        if s > 1:
+            left = BilinearUpsample2DLayer(left, s)
+        left = Convolution(left, f=nf, s=1)
+    left = BatchNormLayer(left)
+    left = NonlinearityLayer(left, leaky_rectify)
+    left = Convolution(left, f=nf, s=1) # shape-preserving, always
+    left = BatchNormLayer(left)
+    #
+    # traditionally, i padded feature maps,
+    # but here, we learn a projection
+    right_ds = layer
+    if not decode:
+        right_ds = Convolution(right_ds, k=1, f=nf, s=s)
+        right_ds = BatchNormLayer(right_ds)
+    else:
+        # upsample using bilinear sampling,
+        # then do the 1x1 convolution to match dims
+        # (don't stride the 1x1 conv, we already did
+        # that with the bilinear upsample)
+        right_ds = BilinearUpsample2DLayer(right_ds, s)
+        right_ds = Convolution(right_ds, k=1, f=nf, s=1)
+        right_ds = BatchNormLayer(right_ds)
+    add = ElemwiseSumLayer([left, right_ds])
+    add = NonlinearityLayer(add, leaky_rectify)
+    return add
+
+def conv_bn_relu(layer, nf, num_repeats=0):
+    conv = layer
+    for r in range(num_repeats+1):
+        if r==0:
+            conv = Convolution(conv, nf)
+        else:
+            conv = Convolution(conv, nf, s=1)
+        conv = BatchNormLayer(conv)
+        conv = NonlinearityLayer(conv, nonlinearity=leaky_rectify)
+    return conv
+
+def up_conv_bn_relu(layer, nf, num_repeats=0):
+    conv = layer
+    for r in range(num_repeats+1):
+        if r==0:
+            conv = UpsampleBilinear(conv, nf)
+        else:
+            conv = Convolution(conv, nf, s=1)
+        conv = BatchNormLayer(conv)
+        conv = NonlinearityLayer(conv, nonlinearity=leaky_rectify)
+    return conv
+
+
+def net_256_2_resblock(nf=64, u_split=0.25, num_repeats=0, act=tanh):
+    i = InputLayer((None, 3, 256, 256))
+    # 1,2,4,8,8,8,8,8
+    mf = [1,2,4]
+    enc = resblock(i, nf*mf[0], s=2) # 128
+    for r in range(num_repeats):
+        enc = resblock(enc, nf*mf[0], s=1)
+    #
+    enc = resblock(enc, nf*mf[1], s=2) # 64
+    for r in range(num_repeats):
+        enc = resblock(enc, nf*mf[1], s=1)
+    #
+    enc = resblock(enc, nf*mf[2], s=2) # 32
+    for r in range(num_repeats):
+        enc = resblock(enc, nf*mf[2], s=1)
+    x = enc
+    # ok split this dude up
+    nf_x = x.output_shape[1]
+    num_for_feat = int(u_split*nf_x)
+    num_for_enc = int((1-u_split)*nf_x)
+    l_feat = SliceLayer(x, axis=1, indices=slice(0, num_for_feat))
+    l_enc = SliceLayer(x, axis=1, indices=slice(num_for_feat, nf_x))
+    x = ConcatLayer([l_feat, l_enc])
+    dec = x
+    # decode
+    dec = resblock(dec, nf*mf[1], s=2, decode=True) # 64
+    for r in range(num_repeats):
+        dec = resblock(dec, nf*mf[1], s=1, decode=True)
+    #
+    dec = resblock(dec, nf*mf[0], s=2, decode=True) # 128
+    for r in range(num_repeats):
+        dec = resblock(dec, nf*mf[0], s=1, decode=True)
+    #
+    dec = UpsampleBilinear(dec, 3) # 256
+    dec = NonlinearityLayer(dec, act)
+    return {"l_in": i, "l_feat": l_feat, "l_enc": l_enc, "out": dec}
+
+def net_256_2(nf=64, u_split=0.25, num_repeats=1, act=tanh):
+    i = InputLayer((None, 3, 256, 256))
+    # 1,2,4,8,8,8,8,8
+    mf = [1,2,4]
+    enc = conv_bn_relu(i, nf*mf[0], num_repeats=num_repeats) # 128
+    enc = conv_bn_relu(enc, nf*mf[1], num_repeats=num_repeats) # 64
+    enc = conv_bn_relu(enc, nf*mf[2], num_repeats=num_repeats) # 32
+    x = enc
+    # ok split this dude up
+    nf_x = x.output_shape[1]
+    num_for_feat = int(u_split*nf_x)
+    num_for_enc = int((1-u_split)*nf_x)
+    l_feat = SliceLayer(x, axis=1, indices=slice(0, num_for_feat))
+    l_enc = SliceLayer(x, axis=1, indices=slice(num_for_feat, nf_x))
+    x = ConcatLayer([l_feat, l_enc])
+    # decode
+    dec = up_conv_bn_relu(x, nf*mf[1], num_repeats=num_repeats) # 64
+    dec = up_conv_bn_relu(dec, nf*mf[0], num_repeats=num_repeats) # 128
+    dec = UpsampleBilinear(dec, 3) # 256
+    dec = NonlinearityLayer(dec, act)
+    return {"l_in": i, "l_feat": l_feat, "l_enc": l_enc, "out": dec}
+
+
+def net_256(nf=64, u_split=0.25, act=tanh):
+    i = InputLayer((None, 3, 256, 256))
+    # 1,2,4,8,8,8,8,8
+    ups = UpsampleBilinear
+    mf = [1,2,4,8,8]
+    # 128
+    conv1 = Convolution(i, nf*mf[0])
+    conv1 = BatchNormLayer(conv1)
+    x = NonlinearityLayer(conv1, nonlinearity=leaky_rectify)
+    # 64
+    conv2 = Convolution(x, nf * mf[1])
+    conv2 = BatchNormLayer(conv2)
+    x = NonlinearityLayer(conv2, nonlinearity=leaky_rectify)
+    # 32
+    conv3 = Convolution(x, nf * mf[2])
+    conv3 = BatchNormLayer(conv3)
+    x = NonlinearityLayer(conv3, nonlinearity=leaky_rectify)
+    # 16
+    conv4 = Convolution(x, nf * mf[3])
+    conv4 = BatchNormLayer(conv4)
+    x = NonlinearityLayer(conv4, nonlinearity=leaky_rectify)
+    # 16
+    conv5 = Convolution(x, nf * mf[4], k=2, s=1, border_mode='valid')
+    conv5 = BatchNormLayer(conv5)
+    x = NonlinearityLayer(conv5, nonlinearity=leaky_rectify)
+    
+    # ok split this dude up
+    nf_x = x.output_shape[1]
+    num_for_feat = int(u_split*nf_x)
+    num_for_enc = int((1-u_split)*nf_x)
+    l_feat = SliceLayer(x, axis=1, indices=slice(0, num_for_feat))
+    l_enc = SliceLayer(x, axis=1, indices=slice(num_for_feat, nf_x))
+    x = ConcatLayer([l_feat, l_enc])
+    
+    # 16
+    dconv1 = Deconvolution(x, nf * mf[3], k=2, s=1)
+    dconv1 = BatchNormLayer(dconv1) #2x2
+    x = dconv1
+    x = NonlinearityLayer(x, leaky_rectify)
+    # 32
+    dconv2 = ups(x, nf * mf[2])
+    dconv2 = BatchNormLayer(dconv2)
+    x = dconv2
+    x = NonlinearityLayer(x, leaky_rectify)
+    # 64
+    dconv3 = ups(x, nf * mf[1])
+    dconv3 = BatchNormLayer(dconv3)
+    x = dconv3
+    x = NonlinearityLayer(x, leaky_rectify)
+    # 128
+    dconv4 = ups(x, nf * mf[0])
+    dconv4 = BatchNormLayer(dconv4)
+    x = dconv4
+    x = NonlinearityLayer(x, leaky_rectify)
+    # 256
+    dconv5 = ups(x, 3)
+    out = NonlinearityLayer(dconv5, act)
+    
+    return {"l_in": i, "l_feat": l_feat, "l_enc": l_enc, "out": out}
+
+def g_unet_256(nf=64, mul_factor=[1,2,4,8,8,8,8,8], u_split=0.25, act=tanh, dropout=0., bilinear_upsample=False, disable_skip=False):
     """
     The UNet in Costa's pix2pix implementation with some added arguments.
     is_a_grayscale:
@@ -84,48 +260,53 @@ def g_unet_256(nf=64, act=tanh, dropout=0., bilinear_upsample=False):
       No idea how it fares when combined with num_repeats...
     num_repeats:
     """
+    assert len(mul_factor)==8
     if bilinear_upsample:
         ups = UpsampleBilinear
     else:
         ups = Deconvolution
     i = InputLayer((None, 3, 256, 256))
+    # 1,2,4,8,8,8,8,8
+
+    mf = mul_factor
+    
     # in_ch x 256 x 256
-    conv1 = Convolution(i, nf)
+    conv1 = Convolution(i, nf*mf[0])
     conv1 = BatchNormLayer(conv1)
     x = NonlinearityLayer(conv1, nonlinearity=leaky_rectify)
     # nf x 128 x 128
-    conv2 = Convolution(x, nf * 2)
+    conv2 = Convolution(x, nf * mf[1])
     conv2 = BatchNormLayer(conv2)
     x = NonlinearityLayer(conv2, nonlinearity=leaky_rectify)
     # nf*2 x 64 x 64
-    conv3 = Convolution(x, nf * 4)
+    conv3 = Convolution(x, nf * mf[2])
     conv3 = BatchNormLayer(conv3)
     x = NonlinearityLayer(conv3, nonlinearity=leaky_rectify)
     # nf*4 x 32 x 32
-    conv4 = Convolution(x, nf * 8)
+    conv4 = Convolution(x, nf * mf[3])
     conv4 = BatchNormLayer(conv4)
     x = NonlinearityLayer(conv4, nonlinearity=leaky_rectify)
     # nf*8 x 16 x 16
-    conv5 = Convolution(x, nf * 8)
+    conv5 = Convolution(x, nf * mf[4])
     conv5 = BatchNormLayer(conv5)
     x = NonlinearityLayer(conv5, nonlinearity=leaky_rectify)
     # nf*8 x 8 x 8
-    conv6 = Convolution(x, nf * 8)
+    conv6 = Convolution(x, nf * mf[5])
     conv6 = BatchNormLayer(conv6)
     x = NonlinearityLayer(conv6, nonlinearity=leaky_rectify)
     # nf*8 x 4 x 4
-    conv7 = Convolution(x, nf * 8)
+    conv7 = Convolution(x, nf * mf[6])
     conv7 = BatchNormLayer(conv7)
     x = NonlinearityLayer(conv7, nonlinearity=leaky_rectify)
     # nf*8 x 2 x 2
-    conv8 = Convolution(x, nf * 8, k=2, s=1, border_mode='valid')
+    conv8 = Convolution(x, nf * mf[7], k=2, s=1, border_mode='valid')
     conv8 = BatchNormLayer(conv8)
     x = NonlinearityLayer(conv8, nonlinearity=leaky_rectify)
 
     # ok split this dude up
     nf_x = x.output_shape[1]
-    num_for_feat = int(0.25*nf_x)
-    num_for_enc = int(0.75*nf_x)
+    num_for_feat = int(u_split*nf_x)
+    num_for_enc = int((1-u_split)*nf_x)
 
     l_feat = SliceLayer(x, axis=1, indices=slice(0, num_for_feat))
     l_enc = SliceLayer(x, axis=1, indices=slice(num_for_feat, nf_x))
@@ -135,45 +316,53 @@ def g_unet_256(nf=64, act=tanh, dropout=0., bilinear_upsample=False):
     # nf*8 x 1 x 1
     #dconv1 = Deconvolution(x, nf * 8,
     #                       k=2, s=1)
-    dconv1 = Deconvolution(x, nf * 8, k=2, s=1)
+    dconv1 = Deconvolution(x, nf * mf[6], k=2, s=1)
     dconv1 = BatchNormLayer(dconv1) #2x2
-    if dropout>0:
-        dconv1 = DropoutLayer(dconv1, p=dropout)
     x = concatenate_layers([dconv1, conv7])
+    if disable_skip:
+        x = dconv1
     x = NonlinearityLayer(x, nonlinearity=leaky_rectify)
     # nf*(8 + 8) x 2 x 2
-    dconv2 = ups(x, nf * 8)
+    dconv2 = ups(x, nf * mf[5])
     dconv2 = BatchNormLayer(dconv2)
-    if dropout>0:
-        dconv2 = DropoutLayer(dconv2, p=dropout)
-    x = concatenate_layers([dconv2, conv6])
+    x = concatenate_layers([dconv2, DropoutLayer(conv6, dropout) if dropout>0 else conv6])
+    if disable_skip:
+        x = dconv2
     x = NonlinearityLayer(x, leaky_rectify)
     # nf*(8 + 8) x 4 x 4
-    dconv3 = ups(x, nf * 8)
+    dconv3 = ups(x, nf * mf[4])
     dconv3 = BatchNormLayer(dconv3)
-    if dropout>0:
-        dconv3 = DropoutLayer(dconv3, p=dropout)
-    x = concatenate_layers([dconv3, conv5])
+    x = concatenate_layers([dconv3, DropoutLayer(conv5, dropout) if dropout>0 else conv5])
+    if disable_skip:
+        x = dconv3
     x = NonlinearityLayer(x, leaky_rectify)
     # nf*(8 + 8) x 8 x 8
-    dconv4 = ups(x, nf * 8)
+    dconv4 = ups(x, nf * mf[3])
     dconv4 = BatchNormLayer(dconv4)
-    x = concatenate_layers([dconv4, conv4])
+    x = concatenate_layers([dconv4, DropoutLayer(conv4, dropout) if dropout>0 else conv4])
+    if disable_skip:
+        x = dconv4
     x = NonlinearityLayer(x, leaky_rectify)
     # nf*(8 + 8) x 16 x 16
-    dconv5 = ups(x, nf * 4)
+    dconv5 = ups(x, nf * mf[2])
     dconv5 = BatchNormLayer(dconv5)
-    x = concatenate_layers([dconv5, conv3])
+    x = concatenate_layers([dconv5, DropoutLayer(conv3, dropout) if dropout>0 else conv3])
+    if disable_skip:
+        x = dconv5
     x = NonlinearityLayer(x, leaky_rectify)
     # nf*(8 + 8) x 32 x 32
-    dconv6 = ups(x, nf * 2)
+    dconv6 = ups(x, nf * mf[1])
     dconv6 = BatchNormLayer(dconv6)
-    x = concatenate_layers([dconv6, conv2])
+    x = concatenate_layers([dconv6, DropoutLayer(conv2, dropout) if dropout>0 else conv2])
+    if disable_skip:
+        x = dconv6
     x = NonlinearityLayer(x, leaky_rectify)
     # nf*(4 + 4) x 64 x 64
-    dconv7 = ups(x, nf * 1)
+    dconv7 = ups(x, nf * mf[0])
     dconv7 = BatchNormLayer(dconv7)
-    x = concatenate_layers([dconv7, conv1])
+    x = concatenate_layers([dconv7, DropoutLayer(conv1, dropout) if dropout>0 else conv1])
+    if disable_skip:
+        x = dconv7
     x = NonlinearityLayer(x, leaky_rectify)
     # nf*(2 + 2) x 128 x 128
     dconv9 = ups(x, 3)
@@ -348,7 +537,29 @@ def discriminator(in_shp, nf=32, act=sigmoid, mul_factor=[1,2,4,8], num_repeats=
 if __name__ == '__main__':
     #x = mnist_encoder()
     #y = mnist_discriminator()
-    x = g_unet_256()
-    for layer in get_all_layers(x):
+    #x = g_unet_256()
+    #for layer in get_all_layers(x):
+    #    print layer, layer.output_shape
+    #print count_params(layer)
+
+    """
+    l_res = InputLayer((None,3,256,256))
+    l_res = resblock(l_res, nf=64, s=2)
+    l_res = resblock(l_res, nf=128, s=2)
+    l_res = resblock(l_res, nf=256, s=2)
+    l_res = resblock(l_res, nf=512, s=2)
+    # decode
+    l_res = resblock(l_res, nf=256, s=2, decode=True)
+    l_res = resblock(l_res, nf=128, s=2, decode=True)
+    l_res = resblock(l_res, nf=64, s=2, decode=True)
+    """
+    #
+
+    l_res = net_256_2_resblock(nf=128)["out"]
+    
+    for layer in get_all_layers(l_res):
         print layer, layer.output_shape
     print count_params(layer)
+
+    from nolearn.lasagne.visualize import draw_to_file
+    draw_to_file(get_all_layers(l_res), "test_resnet.png", verbose=True)

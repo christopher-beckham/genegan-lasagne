@@ -98,10 +98,12 @@ def compose_imgs(a, b, is_a_grayscale=True, is_b_grayscale=False):
     composed[:, w:, :] = bp
     return composed
 
-def plot_grid(out_filename, itr, out_fn, is_a_grayscale, is_b_grayscale, N=4):
+def plot_grid(out_filename, itr, out_fn, is_a_grayscale, is_b_grayscale, N=4, swap=False):
     plt.figure(figsize=(10, 6))
     for i in range(N*N):
         a, b = itr.next()
+        if swap:
+            a, b = b, a
         if out_fn != None:
             bp = out_fn(a)
         else:
