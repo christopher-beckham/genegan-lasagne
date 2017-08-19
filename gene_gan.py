@@ -158,7 +158,8 @@ class GeneGAN():
             
     def train(self, it_train, it_val, batch_size, num_epochs,
               out_dir, model_dir=None, save_every=10,
-              max_imgs=10, resume=False, reduce_on_plateau=False, schedule={}, quick_run=False):
+              resume=False, reduce_on_plateau=False, schedule={}, quick_run=False,
+              plot_args={}):
         def _loop(fn, itr):
             rec = [ [] for i in range(len(self.train_keys)) ]
             for b in range(itr.N // batch_size):
@@ -219,24 +220,17 @@ class GeneGAN():
             f.write("%s\n" % out_str); f.flush()
             dump_train = "%s/dump_train" % out_dir
             dump_valid = "%s/dump_valid" % out_dir
-            dump_Au = "%s/dump_Au" % out_dir
-            dump_B0 = "%s/dump_B0" % out_dir
-            for path in [dump_train, dump_valid, dump_Au, dump_B0]:
+            for path in [dump_train, dump_valid]:
                 if not os.path.exists(path):
                     os.makedirs(path)
-            self.plot(it_train, dump_train, (e+1) % max_imgs, mode='remove')
-            self.plot(it_train, dump_train, (e+1) % max_imgs, mode='add')
-            self.plot(it_val, dump_valid, (e+1) % max_imgs, mode='remove')
-            self.plot(it_val, dump_valid, (e+1) % max_imgs, mode='add')
-            is_grayscale = True if self.im_shp[0]==1 else False
-            plot_grid("%s/Au_recon_%i.png" % (dump_Au, (e+1) % max_imgs), it_val, self.out_fn,
-                      is_a_grayscale=is_grayscale, is_b_grayscale=is_grayscale)
-            plot_grid("%s/B0_recon_%i.png" % (dump_B0, (e+1) % max_imgs), it_val, self.out_fn,
-                      is_a_grayscale=is_grayscale, is_b_grayscale=is_grayscale, swap=True)
+            self.plot(it_train, dump_train, (e+1), mode='remove')
+            self.plot(it_train, dump_train, (e+1), mode='add')
+            self.plot(it_val, dump_valid, (e+1), mode='remove')
+            self.plot(it_val, dump_valid, (e+1), mode='add')
             if model_dir != None and (e+1) % save_every == 0:
                 self.save_model("%s/%i.model" % (model_dir, e+1))
 
-    def plot(self, itr, out_dir, epoch, grid_size=10, mode='remove', deterministic=True):
+    def plot(self, itr, out_dir, epoch, grid_size=5, mode='remove', deterministic=True):
         assert mode in ['remove', 'add']
         zero_fn = self.zero_fn if not deterministic else self.zero_fn_det
         enc_fn = self.enc_fn if not deterministic else self.enc_fn_det
@@ -245,47 +239,48 @@ class GeneGAN():
         im_dim = self.im_shp[-1]
         is_grayscale = True if self.im_shp[0]==1 else False
         # grid with transformed images
-        grid = floatX(np.zeros((im_dim*grid_size, im_dim*grid_size, self.im_shp[0])))
+        grid = floatX(np.zeros((im_dim*grid_size, im_dim*3*grid_size, self.im_shp[0])))
         # grid with ground truth images
-        grid_gt = np.zeros_like(grid)
-        this_Au, this_B0 = itr.next()
+        #grid_gt = np.zeros_like(grid)
+        #this_Au, this_B0 = itr.next()
+        #this_Au_autoencoded = self.out_fn(this_Au)
+        #this_B0_autoencoded = self.out_fn(this_B0)
         ctr = 0
         for i in range(grid_size):
             for j in range(grid_size):
-                if ctr == itr.bs:
+                if ctr == itr.bs or (i == 0 and j == 0):
                     # if we've used all the imgs in the batch, get a fresh new batch
                     this_Au, this_B0 = itr.next()
-                    print this_Au.shape, this_B0.shape
+                    this_Au_autoencoded = self.out_fn(this_Au)
+                    this_B0_autoencoded = self.out_fn(this_B0)
+                    zero_target = zero_fn(this_Au) # if we go from Au -> A0
+                    _, u_actual = enc_fn(this_Au)
+                    add_target = self.dec_use_a_fn(this_B0, u_actual) # if we go from B0 -> Bu
                     ctr = 0
                 if mode == 'remove':
                     # ok, go from Au to A0
-                    target = zero_fn(this_Au)
+                    zero_target = zero_fn(this_Au)
                     # if we're doing 'remove', the ground truth is actually Au
-                    grid_gt[i*im_dim:(i+1)*im_dim, j*im_dim:(j+1)*im_dim, :] = convert_to_rgb(this_Au[ctr],is_grayscale)
+                    A_img = convert_to_rgb(this_Au[ctr], is_grayscale) # gt
+                    B_img = convert_to_rgb(this_Au_autoencoded[ctr], is_grayscale) # auto-enc
+                    C_img = convert_to_rgb(zero_target[ctr], is_grayscale) # remove 'u' vector
                 else:
-                    # ok, go from B0 to Ba
-                    # TODO: figure out bottleneck size
-                    #a_fake = floatX(np.random.normal(0,1,size=(this_B0.shape[0],self.latent_dim)))
-                    #a_actual = a_fake
-                    # get from real latent factors from the Au data
-                    #import pdb
-                    #pdb.set_trace()
-                    _, u_actual = enc_fn(this_Au)
                     # then use those to replace the '0' factor for B0
-                    target = self.dec_use_a_fn(this_B0, u_actual)
-                    # if we're doing 'add', the ground truth is actually B0
-                    grid_gt[i*im_dim:(i+1)*im_dim, j*im_dim:(j+1)*im_dim, :] = convert_to_rgb(this_B0[ctr],is_grayscale)
-                grid[i*im_dim:(i+1)*im_dim, j*im_dim:(j+1)*im_dim, :] = convert_to_rgb(target[ctr],is_grayscale)
+                    A_img = convert_to_rgb(this_B0[ctr], is_grayscale) # gt
+                    B_img = convert_to_rgb(this_B0_autoencoded[ctr], is_grayscale) # auto-enc
+                    C_img = convert_to_rgb(add_target[ctr], is_grayscale) # add 'u' vector
+                three_img = np.zeros((im_dim, im_dim*3, self.im_shp[0]))
+                three_img[:, 0:im_dim, :] = A_img
+                three_img[:, im_dim:(im_dim*2), :] = B_img
+                three_img[:, (im_dim*2):(im_dim*3), :] = C_img
+                grid[i*im_dim:(i+1)*im_dim, j*(im_dim*3):(j+1)*(im_dim*3), :] = three_img
                 ctr += 1
         from skimage.io import imsave
         filename = "%s/%s_%i.png" % (out_dir, mode, epoch)
-        filename_gt = "%s/%s_%i_gt.png" % (out_dir, mode, epoch)
         if self.im_shp[0]==1:
             imsave(arr=grid[:,:,0],fname=filename)
-            imsave(arr=grid_gt[:,:,0],fname=filename_gt)
         else:
             imsave(arr=grid,fname=filename)
-            imsave(arr=grid_gt,fname=filename_gt)
                            
 if __name__ == '__main__':
 
@@ -851,6 +846,117 @@ if __name__ == '__main__':
         if mode == "train":
             model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
                         out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={},resume=True)
+
+
+
+
+
+
+    def dr2_l10_block9_m2_u05(mode,seed):
+        from architectures import block9, discriminator
+        _preset(seed)
+        bs = 4
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=block9,
+            generator_params={'in_shp': im_shp[-1], 'is_a_grayscale':False, 'is_b_grayscale':False, 'multiplier':2, 'u_split':0.5},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr2_l10_block9_m2_u05_repeat"
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={}, save_every=10)
+
+    def dr2_l10_block9_m2_u05_d1_bn(mode,seed):
+        from architectures import block9, discriminator
+        _preset(seed)
+        bs = 4
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=block9,
+            generator_params={'in_shp': im_shp[-1], 'is_a_grayscale':False, 'is_b_grayscale':False, 'multiplier':2, 'u_split':0.5},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':128, 'bn':True, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr2_l10_block9_m2_u05_repeat_d1_bn"
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={}, save_every=10)
+
+    def dr2_l10_block9_m2_u025_d2_bn(mode,seed):
+        from architectures import block9, discriminator
+        _preset(seed)
+        bs = 4
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=block9,
+            generator_params={'in_shp': im_shp[-1], 'is_a_grayscale':False, 'is_b_grayscale':False, 'multiplier':2, 'u_split':0.25},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':True, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr2_l10_block9b_m2_u025_repeat_d2_bn"
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={}, save_every=10)
+
+
+    def dr2_l1_block3_m1_u025_d2_bn(mode,seed):
+        from architectures import block3, discriminator
+        _preset(seed)
+        bs = 4
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=block3,
+            generator_params={'in_shp': im_shp[-1], 'is_a_grayscale':False, 'is_b_grayscale':False, 'multiplier':1, 'u_split':0.25},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':True, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8,8]},
+            im_shp=im_shp,
+            lambda_recon=1.,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr2_l1_block3_m1_u05_repeat_d2_bn"
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={}, save_every=10)
+
+            
+    def dr2_l10_block9_m2_u095(mode,seed):
+        # JUST TO SEE WHAT HAPPENS
+        from architectures import block9, discriminator
+        _preset(seed)
+        bs = 4
+        itr_train, itr_valid = get_dr_iterators(bs)
+        im_shp = (3,256,256)
+        lr=2e-4
+        model = GeneGAN(
+            generator_fn=block9,
+            generator_params={'in_shp': im_shp[-1], 'is_a_grayscale':False, 'is_b_grayscale':False, 'multiplier':2, 'u_split':0.99},
+            discriminator_fn=discriminator,
+            discriminator_params={'in_shp': im_shp, 'nf':64, 'bn':False, 'num_repeats':0, 'act':linear, 'mul_factor':[1,2,4,8]},
+            im_shp=im_shp,
+            lambda_recon=10.,
+            opt_args={'learning_rate':theano.shared(floatX(lr))})
+        name = "dr2_l10_block9_m2_u095"
+        if mode == "train":
+            model.train(it_train=itr_train, it_val=itr_valid, batch_size=bs, num_epochs=1000,
+                        out_dir="output/%s" % name, model_dir="models/%s" % name, schedule={}, save_every=10)
+
+
+
 
             
     locals()[ sys.argv[1] ](sys.argv[2], int(sys.argv[3]))

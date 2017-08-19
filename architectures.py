@@ -106,11 +106,11 @@ def resblock(layer, nf, s=1, decode=False):
     add = NonlinearityLayer(add, leaky_rectify)
     return add
 
-def conv_bn_relu(layer, nf, num_repeats=0):
+def conv_bn_relu(layer, nf, s=1, num_repeats=0):
     conv = layer
     for r in range(num_repeats+1):
         if r==0:
-            conv = Convolution(conv, nf)
+            conv = Convolution(conv, nf, s=s)
         else:
             conv = Convolution(conv, nf, s=1)
         conv = BatchNormLayer(conv)
@@ -534,32 +534,84 @@ def discriminator(in_shp, nf=32, act=sigmoid, mul_factor=[1,2,4,8], num_repeats=
     # 1 x 16 x 16
     return out
 
-if __name__ == '__main__':
-    #x = mnist_encoder()
-    #y = mnist_discriminator()
-    #x = g_unet_256()
-    #for layer in get_all_layers(x):
-    #    print layer, layer.output_shape
-    #print count_params(layer)
+# -----------------------------------------------------------------------
 
-    """
-    l_res = InputLayer((None,3,256,256))
-    l_res = resblock(l_res, nf=64, s=2)
-    l_res = resblock(l_res, nf=128, s=2)
-    l_res = resblock(l_res, nf=256, s=2)
-    l_res = resblock(l_res, nf=512, s=2)
-    # decode
-    l_res = resblock(l_res, nf=256, s=2, decode=True)
-    l_res = resblock(l_res, nf=128, s=2, decode=True)
-    l_res = resblock(l_res, nf=64, s=2, decode=True)
-    """
+def block3(in_shp, is_a_grayscale, is_b_grayscale, u_split, multiplier=1, **kwargs):
+    m = multiplier
+    i = InputLayer((None, 1 if is_a_grayscale else 3, in_shp, in_shp))
+    conv = i
+    # encoder
+    conv = conv_bn_relu(conv, nf=128*m, s=2) #128
+    conv = conv_bn_relu(conv, nf=256*m, s=2) #64
+    conv = conv_bn_relu(conv, nf=512*m, s=2) #32
+    x = conv
+    nf_x = x.output_shape[1]
+    num_for_feat = int(u_split*nf_x)
+    num_for_enc = int((1-u_split)*nf_x)
+    l_feat = SliceLayer(x, axis=1, indices=slice(0, num_for_feat))
+    l_enc = SliceLayer(x, axis=1, indices=slice(num_for_feat, nf_x))
+    x = ConcatLayer([l_feat, l_enc])
+    conv = x
+    # decoder
+    conv = up_conv_bn_relu(conv, nf=512*m) # 64
+    conv = up_conv_bn_relu(conv, nf=256*m) # 128
+    conv = up_conv_bn_relu(conv, nf=128*m) # 256
+    conv = Conv2DLayer(conv, num_filters=1 if is_b_grayscale else 3, filter_size=3, pad='same', stride=1,
+                       nonlinearity=sigmoid if is_b_grayscale else tanh)
+    return {"l_in": i, "l_feat": l_feat, "l_enc": l_enc, "out": conv}
+
+
+def block9(in_shp, is_a_grayscale, is_b_grayscale, u_split, multiplier=1, **kwargs):
+    m = multiplier
+    i = InputLayer((None, 1 if is_a_grayscale else 3, in_shp, in_shp))
+    conv = i
+    conv = batch_norm(Conv2DLayer(conv, num_filters=32*m, filter_size=7, pad='same', nonlinearity=leaky_rectify)) # c7s1
+    # encoder
+    conv = conv_bn_relu(conv, nf=64*m, s=2) # d64
+    conv = conv_bn_relu(conv, nf=128*m, s=2) # d128
     #
-
-    l_res = net_256_2_resblock(nf=128)["out"]
+    x = conv
+    nf_x = x.output_shape[1]
+    num_for_feat = int(u_split*nf_x)
+    num_for_enc = int((1-u_split)*nf_x)
+    l_feat = SliceLayer(x, axis=1, indices=slice(0, num_for_feat))
+    l_enc = SliceLayer(x, axis=1, indices=slice(num_for_feat, nf_x))
+    x = ConcatLayer([l_feat, l_enc])
+    #
+    conv = x
+    # transformer
+    for r in range(4):
+        conv = resblock(conv, nf=128*m, s=1) # R 128
+    x = conv_bn_relu(conv, nf=128*m, s=1)
+    for r in range(4):
+        conv = resblock(conv, nf=128*m, s=1) # R 128
+    # decoder
+    conv = up_conv_bn_relu(conv, nf=64*m) # u64
+    conv = up_conv_bn_relu(conv, nf=32*m) # u32
+    conv = Conv2DLayer(conv, num_filters=1 if is_b_grayscale else 3, filter_size=7, pad='same',
+                       nonlinearity=sigmoid if is_b_grayscale else tanh) # c7s1
     
-    for layer in get_all_layers(l_res):
-        print layer, layer.output_shape
-    print count_params(layer)
+    return {"l_in": i, "l_feat": l_feat, "l_enc": l_enc, "out": conv}
 
-    from nolearn.lasagne.visualize import draw_to_file
-    draw_to_file(get_all_layers(l_res), "test_resnet.png", verbose=True)
+# -------
+
+def block9_debug(in_shp, is_a_grayscale, is_b_grayscale, u_split, multiplier=1, **kwargs):
+    m = multiplier
+    i = InputLayer((None, 1 if is_a_grayscale else 3, in_shp, in_shp))
+    x = i
+    nf_x = x.output_shape[1]
+    num_for_feat = int(u_split*nf_x)
+    num_for_enc = int((1-u_split)*nf_x)
+    l_feat = SliceLayer(x, axis=1, indices=slice(0, num_for_feat))
+    l_enc = SliceLayer(x, axis=1, indices=slice(num_for_feat, nf_x))
+    x = ConcatLayer([l_feat, l_enc])
+    return {"l_in": i, "l_feat": l_feat, "l_enc": l_enc, "out": x}    
+
+if __name__ == '__main__':
+
+    l_res = block9(256, False, False, 0.5)
+    for layer in get_all_layers(l_res["out"]):
+        print layer, layer.output_shape
+
+    ##from nolearn.lasagne.visualize import draw_to_file
+    ##draw_to_file(get_all_layers(l_res), "test_resnet.png", verbose=True)
